@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import geopandas as gpd
 import gurobipy as gp
+import pulp
 from shapely import Point, LineString
 from shapely import wkt
 from shapely.ops import nearest_points
@@ -9,6 +10,7 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 import matplotlib.colors as mcolors
 
+omega = 10
 
 def Subset(elements, types):
     return elements[elements["type"].isin(types)]
@@ -26,21 +28,33 @@ def import_elements(file):
     return elements
 
 def visualize_elements(elements, connections=None):
-    # Define a color map based on the values in 'terminal'
     unique_terminals = elements['terminal'].unique()
-    colors = plt.cm.get_cmap('tab20', len(unique_terminals))  # Use a colormap with a number of colors equal to unique terminals
-
-    # Create a dictionary mapping terminal values to colors
+    colors = plt.cm.get_cmap('tab20', len(unique_terminals))
     color_map = {terminal: colors(i) for i, terminal in enumerate(unique_terminals)}
 
-    fig, ax = plt.subplots(figsize=(10, 10))
+    fig, ax = plt.subplots(figsize=(10, 12))
 
-    # Plot elements with colors based on 'terminal'
     elements['color'] = elements['terminal'].map(color_map)
     elements.plot(ax=ax, color=elements['color'], markersize=50, label='Elements')
 
-    if(connections is not None):
-        # Plot connections
+    # Add element name labels
+    for _, row in elements.iterrows():
+        geom = row['coor']
+        if geom.geom_type == 'Point':
+            x, y = geom.x, geom.y
+        else:
+            x, y = geom.interpolate(0.5, normalized=True).x, geom.interpolate(0.5, normalized=True).y
+        ax.annotate(
+            row['name'],
+            xy=(x, y),
+            xytext=(5, 1),
+            textcoords='offset points',
+            fontsize=8,
+            color='black',
+            clip_on=True
+        )
+
+    if connections is not None:
         connections['color'] = connections['terminal'].map(color_map)
         connections.plot(ax=ax, color=connections['color'], linestyle='--', linewidth=.5, label='Connections')
 
@@ -50,8 +64,6 @@ def visualize_elements(elements, connections=None):
     fig.legends = []
     plt.tight_layout()
     plt.show()
-
-
 
 class Path:
     def __init__(self, elements):
@@ -192,7 +204,6 @@ def astar(elements, element_start, num_paths, D=100):
 
                 else:
                     # Add the child to the open list
-                    connection.g = temp_g
                     connection.f = connection.g + connection.h
                     open_list.append(connection)
 
@@ -216,36 +227,93 @@ def MatrixDivision(elements, H, C,R,T):
     Ht = H.iloc[:,  len(C)+len(R)   :-len(Subset(elements, ["transformer"]))]
     return Hc, Hr, Ht
 
+def optimization_problem(C, R, T, H, Hc, Hr, Ht, solver="gurobi"):
+    if solver == "gurobi":
+        return _optimization_gurobi(C, R, T, H, Hc, Hr, Ht)
+    elif solver == "pulp":
+        return _optimization_pulp(C, R, T, H, Hc, Hr, Ht)
+    else:
+        raise ValueError(f"Unknown solver: '{solver}'. Choose 'gurobi' or 'pulp'.")
 
-def optimization_problem(C,R,T, H,Hc,Hr,Ht):
+def _optimization_gurobi(C, R, T, H, Hc, Hr, Ht):
+    # Gurobi
     model = gp.Model()
-    Hc, Hr, Ht = Hc.values, Hr.values, Ht.values
+    Hc_v, Hr_v, Ht_v = Hc.values, Hr.values, Ht.values
 
     MatrixTr_size = (len(T), len(R))
     MatrixP_size = len(H)
 
-    # Decision Variables
     Tr = model.addMVar(MatrixTr_size, vtype=gp.GRB.BINARY, name="Tr")
-    P = model.addMVar(MatrixP_size, vtype=gp.GRB.BINARY, name="P")
+    P  = model.addMVar(MatrixP_size,  vtype=gp.GRB.BINARY, name="P")
 
-    # Objective function 22a
-    model.setObjective( 10 * P.sum() - Tr.sum(), sense=gp.GRB.MAXIMIZE )
+    model.setObjective(omega * P.sum() - Tr.sum(), sense=gp.GRB.MAXIMIZE)
 
-    #Constaint 22b
     for k in range(Tr.shape[0]):
         for m in range(MatrixP_size):
-            model.addConstr( np.sum(Hr,axis=1)[m] * P[m] * np.transpose(Ht)[k,m] <= ( (Tr @ np.transpose(Hr)) * np.transpose(Ht))[k,m] )
+            model.addConstr(
+                np.sum(Hr_v, axis=1)[m] * P[m] * np.transpose(Ht_v)[k, m]
+                <= ((Tr @ np.transpose(Hr_v)) * np.transpose(Ht_v))[k, m]
+            )
 
-    #Constaint 22c
-    # for k in range(len(C)):
-    model.addConstr( P @ Hc <= 1)
+    model.addConstr(P @ Hc_v <= 1)
 
-    #Constaint 22d
     for k in range(len(R)):
-        model.addConstr( gp.quicksum(Tr)[k] <= 1)
+        model.addConstr(gp.quicksum(Tr)[k] <= 1)
 
     model.optimize()
     return model, Tr, P
+
+def _optimization_pulp(C, R, T, H, Hc, Hr, Ht):
+    # Pulp
+    Hc_v, Hr_v, Ht_v = Hc.values, Hr.values, Ht.values
+    MatrixTr_size = (len(T), len(R))
+    MatrixP_size = len(H)
+
+    model = pulp.LpProblem("network_optimization", pulp.LpMaximize)
+
+    # Decision variables
+    Tr_vars = [[pulp.LpVariable(f"Tr_{i}_{j}", cat="Binary")
+                for j in range(MatrixTr_size[1])] for i in range(MatrixTr_size[0])]
+    P_vars  =  [pulp.LpVariable(f"P_{m}",      cat="Binary")
+                for m in range(MatrixP_size)]
+
+    # Objective  (equivalent to 22a)
+    model += omega * pulp.lpSum(P_vars) - pulp.lpSum(
+        Tr_vars[i][j] for i in range(MatrixTr_size[0]) for j in range(MatrixTr_size[1])
+    )
+
+    # Constraint 22b
+    Hr_row_sums = np.sum(Hr_v, axis=1)          # shape (MatrixP_size,)
+    for k in range(MatrixTr_size[0]):
+        for m in range(MatrixP_size):
+            lhs = Hr_row_sums[m] * Ht_v[m, k] * P_vars[m]
+            rhs = pulp.lpSum(Tr_vars[k][j] * Hr_v[m, j] * Ht_v[m, k]
+                             for j in range(MatrixTr_size[1]))
+            model += lhs <= rhs
+
+    # Constraint 22c
+    for j in range(Hc_v.shape[1]):
+        model += pulp.lpSum(P_vars[m] * Hc_v[m, j] for m in range(MatrixP_size)) <= 1
+
+    # Constraint 22d
+    for j in range(MatrixTr_size[1]):
+        model += pulp.lpSum(Tr_vars[i][j] for i in range(MatrixTr_size[0])) <= 1
+
+    model.solve(pulp.PULP_CBC_CMD(options=["RandomS 42"]))
+
+    # Wrap results so no need to change the other parts
+    class _VarProxy:
+        def __init__(self, row): self._row = row
+        def __iter__(self): return iter(self._row)
+
+    class _ScalarProxy:
+        def __init__(self, v): self.X = pulp.value(v)
+
+    Tr_proxy = [_VarProxy([_ScalarProxy(Tr_vars[i][j]) for j in range(MatrixTr_size[1])])
+                for i in range(MatrixTr_size[0])]
+    P_proxy  = [_ScalarProxy(v) for v in P_vars]
+
+    return model, Tr_proxy, P_proxy
 
 def transform_matrices_in_dfs(H,T,R, Tr, P):
     Tr_sol = pd.DataFrame()
@@ -284,7 +352,7 @@ def DiagnosticFunction(H, C, P_sol, Tr_sol):
         for c in customers_wo_paths:
             print(f"For customer: {c} was not possible to identify a path")
     else:
-        print("No issue identified. For each customers a path was identified")("No issue identified.")
+        print("No issue identified. For each customers a path was identified")
 
     ### Final check ###
     print("\n\n### Summary ###")

@@ -4,6 +4,7 @@ pandas
 shapely
 geopandas
 gurobipy
+pulp
 openpyxl
 scipy
 jupyter
